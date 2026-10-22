@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#111111">
+  <title>Scanner Tiket | SPC 2026</title>
+  <style>
+    :root { color-scheme: dark; --gold:#d9b967; --bg:#101010; --panel:#1b1b1b; --muted:#b8b8b8; }
+    * { box-sizing:border-box; }
+    body { margin:0; padding:16px; background:var(--bg); color:#f7f7f7; font:16px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; }
+    main { max-width:560px; margin:0 auto; }
+    header { padding:8px 2px 16px; }
+    h1 { color:var(--gold); font-size:1.35rem; margin:0 0 6px; }
+    p { margin:6px 0 12px; }
+    .muted { color:var(--muted); font-size:.9rem; }
+    .card { background:var(--panel); border:1px solid #51452c; border-radius:16px; padding:16px; margin:12px 0; }
+    label { display:block; font-size:.92rem; margin:12px 0 5px; color:#eee; }
+    input { width:100%; min-height:44px; padding:10px 12px; border-radius:9px; border:1px solid #555; background:#101010; color:#fff; font-size:16px; }
+    button { width:100%; min-height:46px; padding:11px 14px; margin-top:10px; border:0; border-radius:10px; font-size:16px; font-weight:700; cursor:pointer; }
+    button:disabled { opacity:.45; cursor:not-allowed; }
+    .primary { background:var(--gold); color:#171717; }
+    .secondary { background:#343434; color:#fff; border:1px solid #555; }
+    #reader { width:100%; overflow:hidden; border-radius:12px; background:#080808; min-height:20px; }
+    .result { white-space:pre-line; overflow-wrap:anywhere; border-radius:10px; padding:13px; margin-top:12px; background:#252525; border:1px solid #555; }
+    .success { border:2px solid #36c779; }
+    .error { border:2px solid #f06464; }
+    .notice { border-left:3px solid var(--gold); padding:9px 11px; background:#28251e; font-size:.88rem; }
+    .hidden { display:none !important; }
+    .row { display:flex; gap:8px; }
+    .row button { flex:1; }
+    footer { color:var(--muted); font-size:.8rem; padding:12px 2px 28px; }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>SURYA PALOH CHAMPIONSHIP 2026</h1>
+    <p>Scanner QR untuk penukaran tiket</p>
+    <p class="muted">Penukaran: DPW Partai NasDem DKI Jakarta, Gedung ABN · 10.00–12.00 WIB</p>
+  </header>
+
+  <section class="card">
+    <div class="notice">Gunakan hanya oleh panitia berwenang. Masukkan URL Web App Apps Script dan PIN petugas yang disiapkan di backend. Jangan bagikan PIN.</div>
+    <label for="endpoint">URL Web App Apps Script (akhiran /exec)</label>
+    <input id="endpoint" type="url" placeholder="https://script.google.com/macros/s/.../exec" autocomplete="url">
+    <label for="pin">PIN petugas</label>
+    <input id="pin" type="password" inputmode="numeric" autocomplete="current-password" placeholder="PIN dari koordinator">
+    <button id="save" class="secondary">Simpan URL di perangkat ini</button>
+    <p class="muted">PIN tidak disimpan di browser. Backend harus mendukung API JSONP untuk check dan redeem sebelum scanner dapat memvalidasi tiket.</p>
+  </section>
+
+  <section class="card">
+    <div id="reader"></div>
+    <button id="start" class="primary">MULAI KAMERA</button>
+    <div class="row">
+      <button id="stop" class="secondary" disabled>HENTIKAN KAMERA</button>
+      <button id="reset" class="secondary">SCAN BERIKUTNYA</button>
+    </div>
+    <label for="manual">Atau masukkan kode tiket manual</label>
+    <input id="manual" type="text" placeholder="Contoh: SPC26-A001" autocomplete="off">
+    <button id="checkManual" class="secondary">PERIKSA KODE</button>
+    <div id="result" class="result" role="status" aria-live="polite">Siap. Masukkan URL backend dan PIN petugas, lalu mulai scan.</div>
+    <button id="redeem" class="primary" disabled>KONFIRMASI PENUKARAN</button>
+  </section>
+  <footer>SPC 2026 · Jangan konfirmasi sebelum nama dan kategori cocok dengan peserta. Jika backend belum dikonfigurasi, scanner belum dapat mengubah status tiket.</footer>
+</main>
+
+<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const endpoint = $('endpoint'), pin = $('pin'), result = $('result');
+  const startBtn = $('start'), stopBtn = $('stop'), redeemBtn = $('redeem');
+  let scanner = null, activeCode = '', activeTicket = null, busy = false, cameraOn = false;
+
+  const savedEndpoint = localStorage.getItem('spc26_api_endpoint');
+  if (savedEndpoint) endpoint.value = savedEndpoint;
+
+  function show(text, kind='') {
+    result.className = 'result' + (kind ? ' ' + kind : '');
+    result.textContent = text;
+  }
+  function configOK() {
+    const url = endpoint.value.trim();
+    if (!/^https:\/\/script\.google\.com\/macros\/s\/.+\/exec(?:\?.*)?$/.test(url)) {
+      show('Masukkan URL Web App Apps Script yang benar dan berakhiran /exec.', 'error');
+      return false;
+    }
+    if (!pin.value.trim()) {
+      show('Masukkan PIN petugas yang disiapkan di backend Apps Script.', 'error');
+      return false;
+    }
+    return true;
+  }
+  function jsonp(action, code) {
+    return new Promise((resolve, reject) => {
+      const callback = '__spc26_cb_' + Date.now() + '_' + Math.random().toString(36).slice(2);
+      const script = document.createElement('script');
+      const timer = setTimeout(() => finish(new Error('Backend tidak merespons. Periksa URL, deployment, PIN, dan koneksi.')), 15000);
+      function cleanup() {
+        clearTimeout(timer);
+        delete window[callback];
+        script.remove();
+      }
+      function finish(err, data) {
+        cleanup();
+        if (err) reject(err); else resolve(data);
+      }
+      window[callback] = data => finish(null, data);
+      const base = endpoint.value.trim().replace(/\?.*$/, '');
+      const params = new URLSearchParams({
+        action, code, pin: pin.value.trim(), callback
+      });
+      script.onerror = () => finish(new Error('Tidak bisa menghubungi backend. Pastikan API JSONP sudah dipasang pada Apps Script dan deployment diperbarui.'));
+      script.src = base + '?' + params.toString();
+      document.body.appendChild(script);
+    });
+  }
+  function ticketText(d) {
+    return 'Kode: ' + (d.kode || activeCode || '-') +
+      '\nNama: ' + (d.nama || '-') +
+      '\nKategori: ' + (d.kategori || '-') +
+      '\nStatus: ' + (d.status || '-') +
+      (d.waktu ? '\nWaktu penukaran: ' + d.waktu : '');
+  }
+  async function checkCode(raw) {
+    if (busy) return;
+    if (!configOK()) return;
+    const code = String(raw || '').trim().toUpperCase();
+    if (!code) { show('Kode tiket kosong.', 'error'); return; }
+    busy = true; redeemBtn.disabled = true; activeTicket = null; activeCode = code;
+    show('Memeriksa tiket…');
+    try {
+      const d = await jsonp('check', code);
+      if (!d || d.ok === false || d.valid !== true) {
+        show((d && d.message ? d.message : 'Tiket tidak valid.') + (d && d.nama ? '\n' + ticketText(d) : ''), 'error');
+        activeCode = ''; return;
+      }
+      activeTicket = d;
+      show('TIKET VALID\n' + ticketText(d) + '\n\nCocokkan dengan peserta sebelum konfirmasi.', 'success');
+      redeemBtn.disabled = false;
+    } catch (e) {
+      show(e.message || String(e), 'error'); activeCode = '';
+    } finally { busy = false; }
+  }
+  async function redeem() {
+    if (busy || !activeCode || !activeTicket || !configOK()) return;
+    if (!confirm('Konfirmasi penukaran untuk ' + (activeTicket.nama || activeCode) + '?')) return;
+    busy = true; redeemBtn.disabled = true; show('Menyimpan penukaran…');
+    try {
+      const d = await jsonp('redeem', activeCode);
+      if (!d || d.success !== true) throw new Error((d && d.message) || 'Penukaran tidak berhasil.');
+      show('PENUKARAN BERHASIL\n' + ticketText(d), 'success');
+      activeCode = ''; activeTicket = null; $('manual').value = '';
+    } catch (e) {
+      show(e.message || String(e), 'error');
+      activeCode = ''; activeTicket = null;
+    } finally { busy = false; }
+  }
+  async function startCamera() {
+    if (!configOK()) return;
+    if (!window.Html5Qrcode) {
+      show('Library scanner gagal dimuat. Periksa koneksi internet lalu muat ulang halaman.', 'error'); return;
+    }
+    if (cameraOn) return;
+    try {
+      scanner = new Html5Qrcode('reader');
+      await scanner.start(
+        { facingMode: 'environment' },
+        { fps: 10, qrbox: { width: 240, height: 240 }, aspectRatio: 1.0 },
+        text => {
+          if (busy || activeCode) return;
+          try { scanner.pause(true); } catch (_) {}
+          checkCode(text);
+        },
+        () => {}
+      );
+      cameraOn = true; startBtn.disabled = true; stopBtn.disabled = false;
+      show('Kamera aktif. Arahkan ke QR tiket.');
+    } catch (e) {
+      show('Kamera gagal dibuka: ' + (e && e.message ? e.message : e) + '\nPeriksa izin kamera Chrome dan pastikan halaman memakai HTTPS.', 'error');
+    }
+  }
+  async function stopCamera() {
+    if (!scanner || !cameraOn) return;
+    try { await scanner.stop(); await scanner.clear(); } catch (_) {}
+    scanner = null; cameraOn = false; startBtn.disabled = false; stopBtn.disabled = true;
+  }
+
+  $('save').addEventListener('click', () => {
+    if (!endpoint.value.trim()) { show('Masukkan URL backend terlebih dahulu.', 'error'); return; }
+    localStorage.setItem('spc26_api_endpoint', endpoint.value.trim());
+    show('URL backend disimpan di perangkat ini. PIN tidak disimpan.');
+  });
+  startBtn.addEventListener('click', startCamera);
+  stopBtn.addEventListener('click', stopCamera);
+  redeemBtn.addEventListener('click', redeem);
+  $('checkManual').addEventListener('click', () => checkCode($('manual').value));
+  $('manual').addEventListener('keydown', e => { if (e.key === 'Enter') checkCode($('manual').value); });
+  $('reset').addEventListener('click', async () => {
+    activeCode = ''; activeTicket = null; busy = false; redeemBtn.disabled = true;
+    $('manual').value = '';
+    show(cameraOn ? 'Arahkan kamera ke QR tiket berikutnya.' : 'Siap untuk scan tiket berikutnya.');
+    if (scanner && cameraOn) { try { scanner.resume(); } catch (_) {} }
+  });
+})();
+</script>
+</body>
+</html>
